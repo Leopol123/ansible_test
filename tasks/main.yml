@@ -1,0 +1,203 @@
+---
+# tasks that run after a new deployment
+
+# - name: Load Secrets
+  # include_vars: "secrets.yml"
+
+# - name: Load Variables
+  # include_vars: "vars.yml"
+- name: Install pip
+  apt:
+    name: python-pip
+    state: present
+
+- name: Install pexpect using pip
+  pip:
+    name: pexpect
+  
+- name: Install AD Domain packages
+  apt: 
+    name: "{{ item }}"
+    state: present 
+    update_cache: yes
+  with_items:
+    - adcli
+    - krb5-user
+    - libpam-krb5
+    - sudo
+
+  tags: ad
+
+- name: Copy krb5.conf
+  template: 
+    src: krb5.conf.j2
+    dest: /etc/krb5.conf
+    backup: yes
+    owner: root
+    group: root
+    mode: 0644
+  tags: ad
+
+- name: Create kerberos ticket
+  expect:
+    command: /bin/bash -c "/usr/bin/kinit -V {{ kerberos_user }}"
+    responses:
+      (?i)Password: "{{ kerberos_user_password }}"
+  register: kerberos_ticket_results
+  changed_when: "kerberos_ticket_results.rc != 0"
+  no_log: True
+  tags: ad
+
+- name: Create kerberos ticket debug
+  debug: 
+    msg: "{{ kerberos_ticket_results.stdout }}"
+
+
+# Check if host already in AD
+- name: Checking to see if system is already joined to AD
+  command: /bin/bash -c "net ads testjoin"
+  register: ad_join_results
+  changed_when: "ad_join_results.stdout != 'Join is OK'"
+  failed_when: "ad_join_results.rc != 0 and ad_join_results.rc != 255"
+  
+
+- name: Debug realm_list_results
+  ignore_errors: yes
+  debug:
+    msg: "{{ ad_join_results.rc }} {{ ad_join_results.stdout }}"
+
+
+- name: Join system to AD
+  expect:
+    command: /bin/bash -c "net join -U {{AD_admin_account}} createcomputer="Ordinateurs/Serveurs/Linux" -v"
+    responses:
+      (?i)Password: "{{ kerberos_user_password }}"  
+  when: "ad_join_results.stdout != 'Join is OK'"
+  no_log: True
+  register: join_AD_results
+  tags: ad
+
+- name: Debug Join system to AD
+  when: "ad_join_results.stdout != 'Join is OK'"
+  debug:
+    msg: "{{ join_AD_results.rc }} {{ join_AD_results.stdout }}"
+
+- name: Create Admin groups SUDO_root
+  expect:
+    command: /bin/bash -c "net ads group add "GS-BIO-{{ inventory_hostname_short |upper }}-SUDO_ROOT" -U "{{AD_admin_account}}" -c "{{GROUP_DN}}""
+    responses:
+      (?i)Password: "{{ kerberos_user_password }}"
+  ignore_errors: yes
+  no_log: True  
+  register: add_ad_group_SUDO_results
+  tags: ad
+  changed_when: ("added" in add_ad_group_SUDO_results.stdout)
+  failed_when: "add_ad_group_SUDO_results.rc != 0 and add_ad_group_SUDO_results.rc != 255"
+
+- name: Debug Create Admin groups SUDO_root
+  debug:
+    msg: "{{ add_ad_group_SUDO_results.rc }} {{ add_ad_group_SUDO_results.stdout }}"
+
+- name: Create Admin groups Access
+  expect:
+    command: /bin/bash -c "net ads group add "GS-BIO-{{ inventory_hostname_short |upper }}-ACCESS" -U "{{AD_admin_account}}" -c "{{GROUP_DN}}""
+    responses:
+      (?i)Password: "{{ kerberos_user_password }}"
+  ignore_errors: yes
+  no_log: True  
+  register: add_ad_group_access_results
+  tags: ad
+  changed_when: ("added" in add_ad_group_access_results.stdout)
+  failed_when: "add_ad_group_access_results.rc != 0 and add_ad_group_access_results.rc != 255"
+
+- name: Debug Create Admin groups
+  debug:
+    msg: "{{ add_ad_group_access_results.rc }} {{ add_ad_group_access_results.stdout }}"
+
+- name: Install Winbind
+  apt: 
+    name: "{{ item }}"
+    state: present 
+    update_cache: yes
+  with_items:
+    - winbind
+ 
+- name: Winbind start
+  service:
+    name: winbind
+    enabled: yes
+    state: started
+
+- name: Install Winbind addons
+  apt: 
+    name: "{{ item }}"
+    state: present 
+    update_cache: yes
+  with_items:
+    - libnss-winbind
+    - libpam-winbind
+
+
+- name: Copy common-account
+  template: 
+    src: common-account.j2
+    dest: /etc/pam.d/common-account
+    owner: root
+    group: root
+    mode: 0644
+  tags: ad
+
+- name: Copy common-auth
+  template: 
+    src: common-auth.j2
+    dest: /etc/pam.d/common-auth
+    owner: root
+    group: root
+    mode: 0644
+  tags: ad
+
+- name: Copy common-password
+  template: 
+    src: common-password.j2
+    dest: /etc/pam.d/common-password
+    owner: root
+    group: root
+    mode: 0644
+  tags: ad
+
+- name: Copy common-session
+  template: 
+    src: common-session.j2
+    dest: /etc/pam.d/common-session
+    owner: root
+    group: root
+    mode: 0644
+  tags: ad
+
+- name: Copy nsswitch.conf
+  template: 
+    src: nsswitch.conf.j2
+    dest: /etc/nsswitch.conf
+    owner: root
+    group: root
+    mode: 0644
+  tags: ad
+
+- name: Add domain admins group to sudoers
+  lineinfile: dest=/etc/sudoers state=present line='%GS-BIO-{{ inventory_hostname_short |upper }}-SUDO_ROOT ALL=(ALL:ALL) ALL' regexp='^%GS-BIO'
+
+
+- name: Copy access.conf
+  template:
+    src: access.conf.j2
+    dest: /etc/security/access.conf
+    owner: root
+    group: root
+    mode: 0644
+  tags: ad
+
+# create a directory if it doesn't exist
+- file:
+    path: /home/{{DOMAIN}}
+    state: directory
+    mode: 0751
